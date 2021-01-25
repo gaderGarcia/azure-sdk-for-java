@@ -17,14 +17,13 @@ parameters:
     publishJUnitResults: false
     goals: 'verify'
   TestResultsFiles: ''
-  SubscriptionConfiguration: $(sub-config-azure-cloud-test-resources)
   CloudConfig: {}
-  ResourceGroupLocationCanary: "centraluseuap"
   ArmTemplateParameters: '@{}'
   Location: ''
   Matrix: ''
   DependsOn: ''
   UsePlatformContainer: false
+  DisableAzureResourceCreation: false
 
 jobs:
   - job: ${{ parameters.TestName }}

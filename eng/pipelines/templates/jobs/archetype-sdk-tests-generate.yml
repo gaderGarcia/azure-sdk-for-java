@@ -42,7 +42,7 @@ jobs:
 
 - ${{ each config in parameters.MatrixConfigs }}:
   - ${{ if eq(config.GenerateVMJobs, 'true') }}:
-    - template: ./archetype-sdk-tests-jobs.yml
+    - template: ./archetype-sdk-tests.yml
       parameters:
         UsePlatformContainer: false
         Matrix: dependencies.generate_matrix.outputs['generate_vm_job_matrix_${{ config.Name }}.matrix']
@@ -52,7 +52,7 @@ jobs:
           ${{ param.key }}: ${{ param.value }}
 
   - ${{ if eq(config.GenerateContainerJobs, 'true') }}:
-    - template: ./archetype-sdk-tests-jobs.yml
+    - template: ./archetype-sdk-tests.yml
       parameters:
         UsePlatformContainer: true
         Matrix: dependencies.generate_matrix.outputs['generate_container_job_matrix_${{ config.Name }}.matrix']
