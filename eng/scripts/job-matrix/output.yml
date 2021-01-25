@@ -1,0 +1,230 @@
+trigger:
+  enabled: false
+stages:
+- stage: Public
+  dependsOn: []
+  jobs:
+  - job: generate_matrix
+    variables:
+    - name: displayNameFilter
+      value: $[ coalesce(variables.jobMatrixFilter, '.*') ]
+    pool:
+      name: azsdk-pool-mms-ubuntu-1804-general
+      vmImage: MMSUbuntu18.04
+    displayName: Generate Job Matrix
+    steps:
+    - task: PowerShell@2
+      name: generate_vm_job_matrix_Java_live_test_base
+      displayName: Generate VM Job Matrix
+      inputs:
+        targetType: inline
+        script: >
+          Write-Host "DISPLAY NAME FILTER: $(displayNameFilter)"
+
+          eng/scripts/job-matrix/Create-JobMatrix.ps1 `
+            -ConfigPath eng/pipelines/templates/stages/platform-matrix.json `
+            -Selection sparse `
+            -DisplayNameFilter "$(displayNameFilter)" `
+            -Filters @("!container", "?SupportedClouds=Public")
+        pwsh: true
+  - job: LiveTest
+    dependsOn:
+    - generate_matrix
+    condition: ne(dependencies.generate_matrix.outputs['generate_vm_job_matrix_Java_live_test_base.matrix'], '{}')
+    strategy:
+      maxParallel: 0
+      matrix: $[ dependencies.generate_matrix.outputs['generate_vm_job_matrix_Java_live_test_base.matrix'] ]
+    variables:
+    - name: DocWardenVersion
+      value: '0.7.1'
+    - name: WagonOptions
+      value: '-Dmaven.wagon.rto=300000 -Dmaven.wagon.http.retryHandler.count=3'
+    - name: DefaultOptions
+      value: '--batch-mode --fail-at-end --settings eng/settings.xml $(WagonOptions)'
+    - name: LoggingOptions
+      value: '-Dorg.slf4j.simpleLogger.defaultLogLevel=error -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn'
+    - name: MemoryOptions
+      value: '-Xmx3072m'
+    - name: skipComponentGovernanceDetection
+      value: true
+    - name: AdditionalOptions
+      value: ''
+    - name: PLSkipOptions
+      value: ''
+    - name: JavaBuildVersion
+      value: '1.11'
+    - name: JavaTestVersion
+      value: '1.11'
+    - name: ServiceDirectory
+      value: textanalytics
+    - name: ArmTemplateParameters
+      value: '@{}'
+    timeoutInMinutes: 60
+    pool:
+      name: $(Pool)
+      vmImage: $(OSVmImage)
+    steps:
+    - task: Bash@3
+      displayName: (MacOS) Grant access to ~/.Azure
+      condition: contains(variables['OSVmImage'], 'mac')
+      inputs:
+        targetType: inline
+        script: sudo chown -R runner ~/.Azure
+    - task: Powershell@2
+      inputs:
+        displayName: Register Dogfood environment
+        targetType: inline
+        pwsh: true
+        script: |
+          eng/common/TestResources/Import-AzModules.ps1
+
+          $environmentSpec = @"
+            $(env-config-dogfood)
+          "@ | ConvertFrom-Json -AsHashtable;
+          Add-AzEnvironment @environmentSpec
+    - task: PowerShell@2
+      displayName: Deploy test resources
+      inputs:
+        targetType: inline
+        script: >
+          eng/common/TestResources/Import-AzModules.ps1
+
+
+          $subscriptionConfiguration = @'
+            $(sub-config-azure-cloud-test-resources)
+          '@ | ConvertFrom-Json -AsHashtable;
+
+
+          # The subscriptionConfiguration may have ArmTemplateParameters defined, so
+
+          # pass those in via the ArmTemplateParameters flag, and handle any
+
+          # additional parameters from the pipelines via AdditionalParameters
+
+          eng/common/TestResources/New-TestResources.ps1 `
+            -BaseName 'Generated' `
+            -ServiceDirectory 'textanalytics' `
+            -Location '' `
+            -DeleteAfterHours '8' `
+            @subscriptionConfiguration `
+            -AdditionalParameters $(ArmTemplateParameters) `
+            -CI `
+            -Force `
+            -Verbose | Out-Null
+        pwsh: true
+    - task: CmdLine@2
+      displayName: Bypass local DNS server to workaround issue resolving cognitiveservices names
+      condition: |
+        and(
+          succeededOrFailed(),
+          or(
+            eq(variables['OSVmImage'], 'ubuntu-18.04'),
+            eq(variables['OSVmImage'], 'MMSUbuntu18.04')
+          ),
+          eq(variables['Container'], '')
+        )
+      inputs:
+        script: sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    - task: PowerShell@2
+      displayName: Initialize project list variable
+      inputs:
+        targetType: inline
+        script: |
+          Write-Host "##vso[task.setvariable variable=ProjectList;]"
+        pwsh: true
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.6'
+      inputs:
+        versionSpec: '3.6'
+      condition: and(succeeded(), eq(variables['TestFromSource'],'true'))
+    - task: PythonScript@0
+      displayName: 'Set versions for source build'
+      inputs:
+        scriptPath: 'eng/versioning/set_versions.py'
+        arguments: '--build-type client --pst'
+      condition: and(succeeded(), eq(variables['TestFromSource'],'true'))
+    - task: PythonScript@0
+      displayName: 'Update versions for source build'
+      inputs:
+        scriptPath: 'eng/versioning/update_versions.py'
+        arguments: '--update-type library --build-type client --sr'
+      condition: and(succeeded(), eq(variables['ShouldRunSourceTests'],'true'))
+    - task: Maven@3
+      displayName: 'Build and Install, JDK Version: $(JavaTestVersion)'
+      inputs:
+        mavenPomFile: pom.xml
+        goals: 'install'
+        options: '$(DefaultOptions) -T 1C -DskipTests -Dgpg.skip -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true -Dspotbugs.skip=true -Drevapi.skip=true -pl $(ProjectList) -am'
+        mavenOptions: '$(MemoryOptions) $(LoggingOptions)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: $(JavaTestVersion)
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: false
+    - task: Maven@3
+      displayName: 'Run tests: $(DisplayName)'
+      inputs:
+        mavenPomFile: pom.xml
+        options: $(DefaultOptions) -Dmaven.javadoc.skip=true -Dspotbugs.skip=true -Dcheckstyle.skip=true -Drevapi.skip=true -DtrimStackTrace=false -pl $(ProjectList)
+        mavenOptions: $(MemoryOptions) $(LoggingOptions)
+        javaHomeOption: JDKVersion
+        jdkVersionOption: $(JavaTestVersion)
+        jdkArchitectureOption: x64
+        publishJUnitResults: false
+        goals: verify
+      env:
+        AZURE_TEXT_ANALYTICS_API_KEY: $(java-textanalytics-test-api-key)
+        AZURE_TEXT_ANALYTICS_ENDPOINT: $(java-textanalytics-sdk-endpoint)
+    - task: Maven@3
+      displayName: 'Generate aggregate code coverage report'
+      condition: and(eq(variables['OsName'], 'Windows'), eq(variables['JavaTestVersion'], '1.11'), eq('textanalytics', 'communication'))
+      inputs:
+        mavenPomFile: sdk/textanalytics/pom.xml
+        options: -Pcoverage
+        mavenOptions: '$(MemoryOptions) $(LoggingOptions)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: $(JavaTestVersion)
+        jdkArchitectureOption: 'x64'
+        goals: jacoco:report-aggregate
+        condition: and(succeeded(), ne(variables['TestFromSource'],'true'))
+    - task: PowerShell@2
+      displayName: Remove test resources
+      condition: ne(variables['AZURE_RESOURCEGROUP_NAME'], '')
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: >
+          eng/common/TestResources/Import-AzModules.ps1
+
+
+          $subscriptionConfiguration = @"
+            $(sub-config-azure-cloud-test-resources)
+          "@ | ConvertFrom-Json -AsHashtable;
+
+
+          eng/common/TestResources/Remove-TestResources.ps1 `
+            -ResourceGroupName "${env:AZURE_RESOURCEGROUP_NAME}" `
+            -ServiceDirectory "textanalytics" `
+            @subscriptionConfiguration `
+            -Force `
+            -Verbose
+        pwsh: true
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      condition: or(eq(variables['CaptureRepositoryOnFailure'], 'true'), and(failed(), eq(variables['Build.Reason'],'Schedule')))
+      displayName: 'Capture repo state for analysis'
+      inputs:
+        path: $(System.DefaultWorkingDirectory)
+        artifactName: repository-$(System.JobName)
+    - task: PublishTestResults@2
+      condition: always()
+      inputs:
+        mergeTestResults: true
+        testRunTitle: Live tests for textanalytics $(DisplayName)
+    - task: PublishCodeCoverageResults@1
+      condition: and(eq(variables['OsName'], 'Windows'), eq(variables['JavaTestVersion'], '1.11'), eq('textanalytics', 'communication'))
+      inputs:
+        codeCoverageTool: JaCoCo
+        summaryFileLocation: sdk/textanalytics/target/site/jacoco-aggregate/jacoco.xml
+        reportDirectory: sdk/textanalytics/target/site/jacoco-aggregate/
+        failIfCoverageEmpty: false
+
+
